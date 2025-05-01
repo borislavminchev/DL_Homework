@@ -56,7 +56,7 @@ def train_and_eval(model, name, trn_ld, val_ld, tst_ld, epochs, lr, device, clas
         vl, va, *_ = eval_with_metrics(model, val_ld, crit, device)
         print(f"Ep{e}: trL={tl:.4f} trA={ta:.4f} | valL={vl:.4f} valA={va:.4f}")
     tl, ta, p, r, f1, ytrue, ypred = eval_with_metrics(model, tst_ld, crit, device)
-    print(f"\n{name} Test Acc: {ta:.4f}\n" + classification_report(ytrue, ypred, target_names=classes))
+    print(f"\n{name} Test Acc: {ta:.4f}\n" + str(classification_report(ytrue, ypred, target_names=classes)))
     return model, {'acc_overall': ta, 'p_per': p, 'r_per': r, 'f1_per': f1}
 
 def predict_color(image_path, model, transform, device, classes, topk=1):
@@ -128,7 +128,37 @@ class DeeperCNN(nn.Module):
             nn.Linear(128*8*8,256), nn.ReLU(), nn.Dropout(0.5),
             nn.Linear(256,n)
         )
-    def forward(self,x): return self.classifier(self.features(x))
+    def forward(self,x): 
+        return self.classifier(self.features(x))
+    
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels//reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels//reduction, channels, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return x * self.fc(x)
+
+class SECNN(nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3,16,3,padding=1), nn.ReLU(), SEBlock(16), nn.MaxPool2d(2),
+            nn.Conv2d(16,32,3,padding=1), nn.ReLU(), SEBlock(32), nn.MaxPool2d(2),
+            nn.Conv2d(32,64,3,padding=1), nn.ReLU(), SEBlock(64), nn.MaxPool2d(2)
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64*16*16,128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(128,n)
+        )
+    def forward(self, x):
+        return self.classifier(self.conv(x))
 
 
 # === Main Entry Point ===
@@ -144,11 +174,11 @@ def main():
     NUM_EPOCHS = 10
     LR_BASE    = 1e-3
 
+    # base_tf = transforms.Compose([
+    #     transforms.Resize((128,128)),
+    #     transforms.ToTensor()
+    # ])
     base_tf = transforms.Compose([
-        transforms.Resize((128,128)),
-        transforms.ToTensor()
-    ])
-    aug_tf = transforms.Compose([
         transforms.Resize((128,128)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
@@ -157,12 +187,10 @@ def main():
     ])
 
     train_ds     = datasets.ImageFolder(os.path.join(DATA_DIR,'train'), transform=base_tf)
-    train_ds_aug = datasets.ImageFolder(os.path.join(DATA_DIR,'train'), transform=aug_tf)
     val_ds       = datasets.ImageFolder(os.path.join(DATA_DIR,'val'),   transform=base_tf)
     test_ds      = datasets.ImageFolder(os.path.join(DATA_DIR,'test'),  transform=base_tf)
 
     train_loader     = DataLoader(train_ds,     batch_size=BATCH_SIZE, shuffle=True,  num_workers=4)
-    train_loader_aug = DataLoader(train_ds_aug, batch_size=BATCH_SIZE, shuffle=True,  num_workers=4)
     val_loader       = DataLoader(val_ds,       batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     test_loader      = DataLoader(test_ds,      batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
@@ -172,22 +200,21 @@ def main():
 
     # Manual model definitions
     manual_defs = {
-        'baseline':  BaselineCNN(num_classes),
-        'batchnorm': BaselineBN(num_classes),
-        'leakyrelu': LeakyCNN(num_classes),
-        'dropout25': Dropout25CNN(num_classes),
-        'deeper':    DeeperCNN(num_classes),
-        'augmented': BaselineCNN(num_classes)
+        # 'baseline':  BaselineCNN(num_classes),
+        # 'batchnorm': BaselineBN(num_classes),
+        # 'leakyrelu': LeakyCNN(num_classes),
+        # 'dropout25': Dropout25CNN(num_classes),
+        # 'deeper':    DeeperCNN(num_classes),
+        'secnn': SECNN(num_classes)
     }
 
     # Train & evaluate manual models
     manual_results = {}
     for name, mdl in manual_defs.items():
         print(f"\n[MAIN] Manual model: {name}")
-        tr_loader = train_loader_aug if name=='augmented' else train_loader
         _, metrics = train_and_eval(
             mdl, name,
-            tr_loader, val_loader, test_loader,
+            train_loader, val_loader, test_loader,
             NUM_EPOCHS, LR_BASE,
             device, classes
         )
@@ -210,7 +237,7 @@ def main():
         _, metrics = train_and_eval(
             mdl, name,
             train_loader, val_loader, test_loader,
-            epochs=5, lr=1e-4,
+            epochs=NUM_EPOCHS, lr=LR_BASE,
             device=device, classes=classes
         )
         transfer_results[name] = metrics
